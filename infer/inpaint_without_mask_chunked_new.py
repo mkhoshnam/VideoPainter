@@ -11,14 +11,19 @@ import numpy as np
 import pandas as pd
 import torch
 from torchvision import transforms
+import sys
+import os
+sys.path.append(os.path.expanduser("~/Mohammad/VideoPainter/diffusers/src"))
+
 from diffusers import (
     CogVideoXDPMScheduler,
     CogvideoXBranchModel,
     CogVideoXTransformer3DModel,
     CogVideoXI2VDualInpaintPipeline,
-    CogVideoXI2VDualInpaintAnyLPipeline,
     FluxFillPipeline
 )
+
+from diffusers.pipelines.cogvideo.pipeline_cogvideox_inpainting_i2v_branch_anyl_new import CogVideoXI2VDualInpaintAnyLPipelineNew as CogVideoXI2VDualInpaintAnyLPipeline
 import cv2
 from openai import OpenAI
 from diffusers.utils import export_to_video, load_image, load_video
@@ -119,13 +124,14 @@ def read_video_with_mask(video_path, masks, mask_id, skip_frames_start=0, skip_f
     video = [item.convert("RGB") for item in video]
     return video, masked_video, binary_masks, fps
 
+
 def read_robot_video_with_transparent(
-    normal_path,
-    transparent_path,
-    skip_frames_start=0,
-    skip_frames_end=-1,
-    mask_background=False,
-    fps=0,
+        normal_path,
+        transparent_path,
+        skip_frames_start=0,
+        skip_frames_end=-1,
+        mask_background=False,
+        fps=0,
 ):
     """
     For our RoboCasa drawer data: given normal video and transparent video,
@@ -167,7 +173,7 @@ def read_robot_video_with_transparent(
         # RGB diff
         diff = np.abs(arr_normal.astype(np.int16) - arr_transparent.astype(np.int16))
         diff_gray = diff.max(axis=-1)  # H, W
-        binary_mask = diff_gray > 15   # 1 where robot moved
+        binary_mask = diff_gray > 15  # 1 where robot moved
 
         black_frame = np.zeros_like(arr_normal)
         binary_mask_expanded = np.repeat(binary_mask[:, :, np.newaxis], 3, axis=2)
@@ -326,6 +332,7 @@ def generate_video(
 
     image = None
     video = None
+    init_image = None
 
     if generate_type == "i2v_inpainting":
         # Read CSV row
@@ -334,7 +341,6 @@ def generate_video(
             inpainting_sample_id = 0
         meta_data = df.iloc[inpainting_sample_id, :]
 
-        # Case 1: our drawer CSV (same format as training: transparent + normal)
         if "transparent_path" in df.columns and "normal_path" in df.columns:
             transparent_path = str(meta_data["transparent_path"])
             normal_path = str(meta_data["normal_path"])
@@ -356,14 +362,29 @@ def generate_video(
             )
             print("-" * 100)
 
-            video, masked_video, binary_masks, fps = read_robot_video_with_transparent(
-                normal_path=normal_path,
-                transparent_path=transparent_path,
-                skip_frames_start=start_frame,
-                skip_frames_end=end_idx,
-                mask_background=mask_background,
-                fps=fps,
-            )
+            # --- MASK-FREE INPUTS ---
+            # 1) full normal video with robot
+            full_normal_video = load_video(normal_path)[start_frame:end_idx]
+            # 2) transparent video (no robot) as conditioning
+            transparent_video = load_video(transparent_path)[start_frame:end_idx]
+
+            if len(full_normal_video) == 0:
+                raise ValueError(f"No frames loaded from normal video: {normal_path}")
+            if len(transparent_video) == 0:
+                raise ValueError(f"No frames loaded from transparent video: {transparent_path}")
+            if len(full_normal_video) != len(transparent_video):
+                raise ValueError(
+                    f"normal and transparent have different #frames: "
+                    f"{len(full_normal_video)} vs {len(transparent_video)}"
+                )
+
+            # init robot image = first frame of normal video
+            init_image = full_normal_video[0].convert("RGB")
+
+            # conditioning video = transparent video (no robot)
+            video = [frame.convert("RGB") for frame in transparent_video]
+
+            # no construct masked_video or binary_masks here (mask-free)
 
         # Case 2: fallback to original Videovo/Pexels meta format (path + mask_id + all_masks.npz)
         else:
@@ -416,7 +437,39 @@ def generate_video(
 
         if inpainting_branch:
             print(f"Using the provided inpainting branch: {inpainting_branch}")
-            branch = CogvideoXBranchModel.from_pretrained(inpainting_branch, torch_dtype=dtype).to(dtype=dtype).cuda()
+            # --- PATCH: Manual Load for 32-Channel Mask-Free Model ---
+            print(f"PATCH: Manually loading 32-channel weights from {inpainting_branch}")
+            from safetensors.torch import load_file
+            import torch.nn as nn
+            
+            # 1. Load Config & Build Skeleton
+            config = CogvideoXBranchModel.load_config(inpainting_branch)
+            branch = CogvideoXBranchModel.from_config(config).to(dtype=dtype)
+            
+            # 2. Slice First Layer to 32 Channels
+            with torch.no_grad():
+                old_layer = branch.patch_embed.proj
+                new_layer = nn.Conv2d(
+                    in_channels=32,
+                    out_channels=old_layer.out_channels,
+                    kernel_size=old_layer.kernel_size,
+                    stride=old_layer.stride,
+                    padding=old_layer.padding,
+                ).to(dtype=dtype)
+                branch.patch_embed.proj = new_layer
+                branch.config.in_channels = 16 
+
+            # 3. Load Weights
+            w_path = os.path.join(inpainting_branch, "diffusion_pytorch_model.safetensors")
+            if not os.path.exists(w_path):
+                w_path = os.path.join(inpainting_branch, "diffusion_pytorch_model.bin")
+                state_dict = torch.load(w_path, map_location="cpu")
+            else:
+                state_dict = load_file(w_path)
+            
+            branch.load_state_dict(state_dict)
+            branch = branch.cuda()
+            # ---------------------------------------------------------
             if id_adapter_resample_learnable_path is None:
                 pipe = CogVideoXI2VDualInpaintAnyLPipeline.from_pretrained(
                     model_path,
@@ -544,6 +597,33 @@ def generate_video(
             del pipe_img_inpainting
             torch.cuda.empty_cache()
 
+    
+    # --- PATCH: Slice weights for Mask-Free Inference (33 -> 32 channels) ---
+    if hasattr(pipe, "branch") and pipe.branch.patch_embed.proj.weight.shape[1] == 33:
+        print("PATCHING INFERENCE: Slicing branch weights from 33 to 32 channels.")
+        import torch.nn as nn
+        with torch.no_grad():
+            old_w = pipe.branch.patch_embed.proj.weight
+            old_b = pipe.branch.patch_embed.proj.bias
+            
+            # Create new 32-channel layer (16 latent + 16 context)
+            new_conv = nn.Conv2d(
+                in_channels=32, 
+                out_channels=old_w.shape[0], 
+                kernel_size=old_w.shape[2:], 
+                stride=pipe.branch.patch_embed.proj.stride, 
+                padding=pipe.branch.patch_embed.proj.padding
+            )
+            
+            # Copy weights (dropping the 33rd channel which corresponds to the mask)
+            new_conv.weight.data = old_w[:, :32, :, :]
+            new_conv.bias.data = old_b
+            
+            # Replace the layer
+            pipe.branch.patch_embed.proj = new_conv
+            pipe.branch.config.in_channels = 16
+    # ------------------------------------------------------------------------
+
     pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
     pipe.to("cuda")
 
@@ -552,29 +632,31 @@ def generate_video(
         pipe.vae.enable_tiling()
 
     if generate_type == "i2v_inpainting":
+        if inpainting_frames is None:
+            raise ValueError("inpainting_frames must be set for i2v_inpainting.")
+
         frames = inpainting_frames
         down_sample_fps = fps if down_sample_fps == 0 else down_sample_fps
-        video, masked_video, binary_masks = video[::int(fps // down_sample_fps)], masked_video[
-            ::int(fps // down_sample_fps)], binary_masks[::int(fps // down_sample_fps)]
+
+        # Downsample only the conditioning video (transparent)
+        step = int(fps // down_sample_fps) if fps > 0 else 1
+        video = video[::max(step, 1)]
+
         if not long_video:
-            video, masked_video, binary_masks = video[:frames], masked_video[:frames], binary_masks[:frames]
+            video = video[:frames]
 
         if len(video) < frames:
             raise ValueError(
-                f"video length is less than {frames}, len(video): {len(video)}, using {len(video) - len(video) % 4 + 1} frames...")
+                f"video length is less than {frames}, len(video): {len(video)}, "
+                f"using {len(video) - len(video) % 4 + 1} frames..."
+            )
 
-        if first_frame_gt:
-            gt_mask_first_frame = binary_masks[0]
-            if mask_background:
-                binary_masks[0] = Image.fromarray(
-                    np.ones_like(np.array(binary_masks[0])) * 255
-                ).convert("RGB")
-            else:
-                binary_masks[0] = Image.fromarray(
-                    np.zeros_like(np.array(binary_masks[0]))
-                ).convert("RGB")
+        # Init image: if we set it from CSV branch, use it, otherwise fall back to first frame
+        image = init_image if init_image is not None else video[0]
 
-        image = masked_video[0]
+        # Dummy all-black masks only to satisfy pipeline API (no information content)
+        binary_masks = [Image.new("RGB", image.size, 0) for _ in video]
+
         inpaint_outputs = pipe(
             prompt=prompt,
             image=image,
@@ -584,47 +666,25 @@ def generate_video(
             use_dynamic_cfg=True,
             guidance_scale=guidance_scale,
             generator=torch.Generator().manual_seed(seed),
-            video=masked_video,
-            masks=binary_masks,
+            video=video,  # transparent conditioning video
+            masks=binary_masks,  # dummy masks, ignored logic-wise
             strength=1.0,
             replace_gt=replace_gt,
-            mask_add=mask_add,
+            mask_add=False,  # ← IMPORTANT CHANGE
             stride=int(frames - overlap_frames),
             prev_clip_weight=prev_clip_weight,
             id_pool_resample_learnable=True if id_adapter_resample_learnable_path is not None else False,
             output_type="np",
         ).frames[0]
+
         video_generate = inpaint_outputs
 
-        # Only restore things that were actually changed / defined
-        if first_frame_gt:
-            binary_masks[0] = gt_mask_first_frame
-
-        if "gt_video_first_frame" in locals():
-            # Defined only in the img_inpainting_model branch above
-            video[0] = gt_video_first_frame
-
-        # Save visualization with 4 panels
-        round_video = _visualize_video(
-            pipe,
-            mask_background,
-            video[: len(video_generate)],
-            video_generate,
-            binary_masks[: len(video_generate)],
-        )
-        export_to_video(
-            round_video,
-            output_path.replace(".mp4", f"_fps{down_sample_fps}_viz.mp4"),
-            fps=8,
-        )
-        
-        # Save only the generated video (no panels)
+        # Save only the generated video (no mask visualization)
         export_to_video(
             video_generate,
             output_path.replace(".mp4", f"_fps{down_sample_fps}.mp4"),
-            fps=8,
+            fps=down_sample_fps,
         )
-
 
     else:
         raise NotImplementedError

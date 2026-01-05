@@ -26,3 +26,5 @@ app/result
 
 !./app/assets/**
 .venv-videopainter/
+
+.venv-videopainter/
