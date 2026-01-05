@@ -25,3 +25,4 @@ app/result
 *tmp_gradio*
 
 !./app/assets/**
+.venv-videopainter/
