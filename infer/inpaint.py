@@ -25,7 +25,8 @@ from io import BytesIO
 import base64
 
 
-vlm_model = OpenAI()
+# vlm_model = OpenAI()  # Don't initialize here
+vlm_model = None  # Will be initialized later if needed
 
 def _visualize_video(pipe, mask_background, original_video, video, masks):
     

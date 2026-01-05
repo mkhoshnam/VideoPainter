@@ -38,7 +38,7 @@ prev_clip_weight=0.0
 
 img_inpainting_model="../ckpt/flux_inp"
 
-llm_model="gpt-4o"
+llm_model="None"
 
 dilate_size=32
 
